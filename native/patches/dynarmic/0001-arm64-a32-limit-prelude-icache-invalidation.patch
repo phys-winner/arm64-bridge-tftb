@@ -1,0 +1,143 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -4,6 +4,13 @@
+  */
+ 
+ #include "dynarmic/backend/arm64/a32_address_space.h"
++
++#if defined(DYNARMIC_ENABLE_ARM64_PERF_MAP)
++#    include <cinttypes>
++#    include <cstdio>
++#    include <mutex>
++#    include <unistd.h>
++#endif
+ 
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+ #include "dynarmic/backend/arm64/abi.h"
+@@ -20,6 +27,57 @@
+ 
+ namespace Dynarmic::Backend::Arm64 {
+ 
++#if defined(DYNARMIC_ENABLE_ARM64_PERF_MAP)
++namespace {
++
++#    if !defined(DYNARMIC_ARM64_PERF_MAP_DIRECTORY)
++#        define DYNARMIC_ARM64_PERF_MAP_DIRECTORY "/data/local/tmp"
++#    endif
++
++std::mutex perf_map_mutex;
++std::FILE* perf_map_file = nullptr;
++bool perf_map_open_attempted = false;
++size_t perf_map_registration_count = 0;
++
++void PerfMapRegister(const void* start, size_t size, const char* friendly_name) {
++    if (size == 0) {
++        return;
++    }
++
++    std::lock_guard guard{perf_map_mutex};
++    if (!perf_map_open_attempted) {
++        perf_map_open_attempted = true;
++        char path[512];
++        const int path_length = std::snprintf(path, sizeof(path), "%s/perf-%d.map",
++                                              DYNARMIC_ARM64_PERF_MAP_DIRECTORY, getpid());
++        if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(path)) {
++            std::fprintf(stderr, "Dynarmic ARM64 perf-map path is too long\n");
++            return;
++        }
++
++        perf_map_file = std::fopen(path, "w");
++        if (!perf_map_file) {
++            std::fprintf(stderr, "Dynarmic ARM64 perf-map open failed: %s\n", path);
++            return;
++        }
++        std::setvbuf(perf_map_file, nullptr, _IOFBF, 64 * 1024);
++        std::fprintf(stderr, "Dynarmic ARM64 perf-map: %s\n", path);
++    }
++    if (!perf_map_file) {
++        return;
++    }
++
++    const auto address = reinterpret_cast<std::uintptr_t>(start);
++    std::fprintf(perf_map_file, "0x%016" PRIxPTR " 0x%zx %s\n", address, size, friendly_name);
++    ++perf_map_registration_count;
++    if (perf_map_registration_count == 1 || perf_map_registration_count % 64 == 0) {
++        std::fflush(perf_map_file);
++    }
++}
++
++}  // anonymous namespace
++#endif
++
+ template<auto mfp, typename T>
+ static void* EmitCallTrampoline(oaknut::CodeGenerator& code, T* this_) {
+     using namespace oaknut::util;
+@@ -176,7 +234,9 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+         Optimization::DeadCodeElimination(ir_block);
+     }
+     Optimization::IdentityRemovalPass(ir_block);
++#if defined(DYNARMIC_ENABLE_JIT_VALIDATION)
+     Optimization::VerificationPass(ir_block);
++#endif
+ 
+     return ir_block;
+ }
+@@ -360,9 +420,12 @@ void A32AddressSpace::EmitPrelude() {
+     code.l(l_return_to_dispatcher);
+     code.dx(mcl::bit_cast<u64>(prelude_info.return_to_dispatcher));
+ 
+     prelude_info.end_of_prelude = code.offset();
++#if defined(DYNARMIC_ENABLE_ARM64_PERF_MAP)
++    PerfMapRegister(mem.ptr(), static_cast<size_t>(prelude_info.end_of_prelude), "dynarmic_a32_prelude");
++#endif
+ 
+-    mem.invalidate_all();
++    mem.invalidate(mem.ptr(), static_cast<size_t>(prelude_info.end_of_prelude));
+     ProtectCodeMemory();
+ }
+ 
+@@ -414,11 +477,18 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+     };
+ }
+ 
+-void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
++void A32AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) {
+     const A32::LocationDescriptor descriptor{block.Location()};
+     const A32::LocationDescriptor end_location{block.EndLocation()};
+     const auto range = boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1);
+     block_ranges.AddRange(range, descriptor);
++
++#if defined(DYNARMIC_ENABLE_ARM64_PERF_MAP)
++    char friendly_name[96];
++    std::snprintf(friendly_name, sizeof(friendly_name), "dynarmic_a32_%c_%08" PRIx32 "_d%016" PRIx64,
++                  descriptor.TFlag() ? 't' : 'a', descriptor.PC(), descriptor.UniqueHash());
++    PerfMapRegister(block_info.entry_point, block_info.size, friendly_name);
++#endif
+ }
+ 
+ }  // namespace Dynarmic::Backend::Arm64
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.cpp b/src/dynarmic/backend/arm64/emit_arm64.cpp
+--- a/src/dynarmic/backend/arm64/emit_arm64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64.cpp
+@@ -243,16 +243,20 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
+         }
+ 
+         reg_alloc.UpdateAllUses();
++#if defined(DYNARMIC_ENABLE_JIT_VALIDATION)
+         reg_alloc.AssertAllUnlocked();
++#endif
+ 
+         if (conf.very_verbose_debugging_output) {
+             EmitVerboseDebuggingOutput(code, ctx);
+         }
+     }
+ 
+     fpsr_manager.Spill();
+ 
++#if defined(DYNARMIC_ENABLE_JIT_VALIDATION)
+     reg_alloc.AssertNoMoreUses();
++#endif
+ 
+     EmitAddCycles(code, ctx, block.CycleCount());
+     conf.emit_terminal(code, ctx);
